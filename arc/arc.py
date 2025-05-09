@@ -1,72 +1,69 @@
 from transformers import GenerationConfig
 import torch
-from typing import List, Dict, Any
+from typing import List
 import numpy as np
-import copy
 
 from .utils import (
     system_prompt,
     user_message_template1,
     user_message_template2,
     user_message_template3,
-)  # Ensure these are updated if prompt engineering changes
-from .augmentations import apply_random_augmentation
-
-from transformers import BitsAndBytesConfig, AutoModelForCausalLM, AutoTokenizer
+)
+from transformers import (
+    BitsAndBytesConfig,
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    GenerationConfig,
+)
 from peft import get_peft_model, LoraConfig, PeftModel, PeftConfig
 import os
 import json
 from torch import nn
 import torch.nn.functional as F
-import glob
-import random
 
 from torch.optim import AdamW
 from torch.utils.data import Dataset, DataLoader
 
 
 class ARCSolver:
-    def __init__(
-        self,
-        token=None,
-        model_id="Qwen/Qwen3-4B",
-        artifacts_path="artifacts/checkpoint-final",
-    ):
-        self.model_id = model_id
-        self.artifacts_path = artifacts_path
-        self.token = token
-        self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    """
+    You should implement a `Solver` class for the project.
+    """
 
-        self._load_model_and_tokenizer()
+    def __init__(self, token=None):
+        """
+        Args:
+            token (str): a huggingface token for restricted models such as llama3
+        """
+        config_path = "artifacts/config/config.yml"
+        model_id = "Qwen/Qwen3-4B"
+
+        # Configure the BitsAndBytes settings for 4-bit quantization to reduce memory usage
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,  # Enable 4-bit quantization
+            bnb_4bit_use_double_quant=True,  # Use double quantization for improved precision
+            bnb_4bit_quant_type="nf4",  # Specify the quantization type
+            bnb_4bit_compute_dtype=torch.float16,  # Set the computation data type
+        )
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            trust_remote_code=True,  # Allow the model to use custom code from the repository
+            quantization_config=bnb_config,  # Apply the 4-bit quantization configuration
+            attn_implementation="sdpa",  # Use scaled-dot product attention for better performance
+            torch_dtype=torch.float16,  # Set the data type for the model
+            use_cache=False,  # Disable caching to save memory
+            device_map="cuda:0",  # Automatically map the model to available devices (e.g., GPUs)
+            token=token,
+        )
+
+        self.tokenizer = AutoTokenizer.from_pretrained(model_id, token=token)
 
         self.pixel_ids = [
             self.tokenizer.encode(str(i), add_special_tokens=False)[0]
             for i in range(10)
         ]
         self.sep = self.tokenizer.encode("\n", add_special_tokens=False)[0]
-
-        self.original_lora_weights = None
-
-    def _load_model_and_tokenizer(self):
-        bnb_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.float16,
-        )
-        self.model = AutoModelForCausalLM.from_pretrained(
-            self.model_id,
-            trust_remote_code=True,
-            quantization_config=bnb_config,
-            attn_implementation="sdpa",
-            torch_dtype=torch.float16,
-            use_cache=False,
-            device_map=self.device,
-            token=self.token,
-        )
-        self.tokenizer = AutoTokenizer.from_pretrained(self.model_id, token=self.token)
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
     def parse_grid(self, ids: List[int]):
         """
@@ -110,265 +107,186 @@ class ARCSolver:
         return ids
 
     def grid_to_str(self, grid: List[List[int]]) -> str:
-        return "\n".join("".join(map(str, r)) for r in grid)
+        # 줄마다 012… 형식, 줄 끝에 \n
+        return "\n".join("".join(str(c) for c in row) for row in grid)
 
-    def format_prompt(self, datapoint: Dict[str, Any], is_ttt_prompt: bool = False):
-        """
-        Args:
-            datapoint (dict): contains training data, test input
-
-        Returns:
-            prompt (dict): dictionary that contains input ids and additional informations
-        """
+    def format_prompt(self, datapoint):
         train_examples = datapoint["train"]
+        test_inp = datapoint["test"][0]["input"]
 
-        if is_ttt_prompt:
-            test_inp = datapoint["train"][-1]["input"]
-
-        else:
-            test_inp = datapoint["test"][0]["input"]
-
-        current_system_prompt = "You are an expert ARC puzzle solver. Analyze the provided input-output examples to understand the underlying transformation rule. Then, apply this rule to the final input grid to generate the correct output grid. Represent grids as rows of numbers, with each row on a new line."
-
+        # ChatML 메시지 배열
         messages = [
-            {"role": "system", "content": current_system_prompt},
+            {"role": "system", "content": system_prompt},
         ]
-
-        current_user_message_template1 = (
-            "Here are some examples of a transformation rule:"
-        )
-        messages.append({"role": "user", "content": current_user_message_template1})
-
+        messages.append(f"{user_message_template1}\n")
+        # 학습 예제 3개
         for ex in train_examples:
-            msg_content = f"Example Input:\n{self.grid_to_str(ex['input'])}\nExample Output:\n{self.grid_to_str(ex['output'])}"
-            messages.append({"role": "user", "content": msg_content})
-
-        if not is_ttt_prompt:
-            current_user_message_template2 = (
-                "Now, based on these examples, transform the following input grid:"
+            msg = (
+                f"input:\n{self.grid_to_str(ex['input'])}\n"
+                f"output:\n{self.grid_to_str(ex['output'])}"
             )
-            current_user_message_template3 = "Provide only the output grid."
-            test_msg_content = f"{current_user_message_template2}\nInput:\n{self.grid_to_str(test_inp)}\n{current_user_message_template3}"
-            messages.append({"role": "user", "content": test_msg_content})
+            messages.append({"role": "user", "content": msg})
+
+        test_msg = (
+            f"{user_message_template2}\n"
+            f"input:\n{self.grid_to_str(test_inp)}\n"
+            f"{user_message_template3}"
+        )
+        messages.append({"role": "user", "content": test_msg})
 
         input_ids = self.tokenizer.apply_chat_template(
             messages,
-            add_generation_prompt=not is_ttt_prompt,
+            add_generation_prompt=True,  # assistant 턴 여는 토큰 추가
+            enable_thinking=False,  # THINKING MODE ON
             tokenize=True,
             return_tensors="pt",
         ).to(self.device)
 
         return {
-            "input_ids": input_ids[0],
-            "input_grid_for_shape_ref": test_inp,
-            "train_examples_for_shape_ref": train_examples,
+            "input_ids": input_ids[0],  # [seq] → [L]
+            "input": test_inp,
+            "train": train_examples,
         }
 
-    def seq2seq_loss(self, prompt_ids, target_grid_ids):
-        inp = torch.cat([prompt_ids.unsqueeze(0), target_grid_ids.unsqueeze(0)], dim=1)
+    def stepwise_loss(self, prompt_ids, target_ids, use_cache=False):
+        """
+        prompt_ids : [1, L]  (프롬프트)
+        target_ids : [1, T]  (정답 토큰 시퀀스)
+        returns CE loss 합계 (scalar)
+        """
+        device = prompt_ids.device
+        loss_total = 0.0
+        past_kv = None  # KV-cache (use_cache=True 일 때만)
+
+        for i in range(target_ids.size(1)):
+            outputs = self.model(
+                input_ids=prompt_ids if past_kv is None else target_ids[:, i - 1 : i],
+                past_key_values=past_kv,
+                use_cache=use_cache,
+            )
+            logits = outputs.logits[:, -1, :]  # 마지막 토큰 로짓
+            loss_i = F.cross_entropy(logits, target_ids[:, i])
+            loss_total += loss_i
+
+            past_kv = outputs.past_key_values if use_cache else None
+            # teacher token → 다음 입력
+            prompt_ids = torch.cat([prompt_ids, target_ids[:, i : i + 1]], dim=1)
+
+        return loss_total
+
+    def seq2seq_loss(self, prompt_ids, target_ids):
+        """
+        prompt_ids  : [B, L]  ← 문제 설명(프롬프트)
+        target_ids  : [B, T]  ← 정답 토큰 시퀀스
+        ------------------------------------------
+        inp   = [B, L+T]      ←  [프롬프트][정답] 한줄로 연결
+        labels= same shape     (프롬프트 부분은 -100으로 마스킹)
+        ------------------------------------------
+        model(input_ids=inp, labels=labels)  →  .loss
+        """
+        eos = self.tokenizer.eos_token_id
+        if target_ids[0, -1] != eos:
+            eos_tensor = torch.tensor(
+                [[eos]], dtype=target_ids.dtype, device=target_ids.device
+            )
+            target_ids = torch.cat([target_ids, eos_tensor], dim=1)
+
+        inp = torch.cat([prompt_ids, target_ids], dim=1)
         labels = inp.clone()
-        labels[:, : prompt_ids.size(0)] = -100  # Mask prompt part
+        labels[:, : prompt_ids.size(1)] = -100
+
         outputs = self.model(input_ids=inp, labels=labels)
         return outputs.loss
 
-    def _perform_ttt(
-        self,
-        ttt_examples: List[Dict[str, Any]],
-        ttt_steps: int = 5,
-        ttt_lr: float = 1e-4,
-    ):
-        if not ttt_examples:
-            return
-
+    def train(self, train_dataset):
+        """
+        Train a model with train_dataset.
+        """
+        # Set the model to training mode
         self.model.train()
 
-        optimizer = AdamW(
-            filter(lambda p: p.requires_grad, self.model.parameters()), lr=ttt_lr
-        )
-
-        for step in range(ttt_steps):
-            total_loss_this_step = 0
-            num_samples_this_step = 0
-            for example_pair in ttt_examples:
-                ttt_datapoint = {
-                    "train": [example_pair],
-                    "test": [{"input": example_pair["input"]}],
-                }
-
-                prompt_messages_for_ttt = [
-                    {
-                        "role": "system",
-                        "content": "You are learning to map this input to this output.",
-                    },
-                    {
-                        "role": "user",
-                        "content": f"Input:\n{self.grid_to_str(example_pair['input'])}\nOutput:",
-                    },
-                ]
-                prompt_ids = self.tokenizer.apply_chat_template(
-                    prompt_messages_for_ttt,
-                    add_generation_prompt=True,
-                    tokenize=True,
-                    return_tensors="pt",
-                ).to(self.device)[0]
-
-                target_grid_tokens = self.format_grid(example_pair["output"])
-                target_ids = torch.tensor(target_grid_tokens, dtype=torch.long).to(
-                    self.device
-                )
-
-                if target_ids.nelement() == 0:
-                    continue
-
-                loss = self.seq2seq_loss(prompt_ids, target_ids)
-                if loss is not None:
-                    loss.backward()
-                    total_loss_this_step += loss.item()
-                    num_samples_this_step += 1
-
-            if num_samples_this_step > 0:
-                optimizer.step()
-                optimizer.zero_grad()
-
-        self.model.eval()
-
-    def train(
-        self,
-        train_dataset_path: str,
-        epochs: int = 3,
-        lr: float = 5e-5,
-        batch_size: int = 1,
-        grad_accum_steps: int = 4,
-        max_steps: int = -1,
-    ):
-        self.model.train()
-
+        # LoRA 설정 - Attention 모듈에 적용
         peft_config = LoraConfig(
             task_type="CAUSAL_LM",
             inference_mode=False,
-            r=16,
-            lora_alpha=32,
-            lora_dropout=0.05,
-            target_modules=[
-                "q_proj",
-                "k_proj",
-                "v_proj",
-                "o_proj",
-                "gate_proj",
-                "up_proj",
-                "down_proj",
-            ],  # Common for Llama/Qwen
+            r=8,  # LoRA 행렬의 랭크
+            lora_alpha=32,  # LoRA 스케일링 파라미터
+            lora_dropout=0.1,
+            # Qwen2 모델의 트랜스포머 주요 가중치 타겟팅
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
         )
+
+        # 모델에 LoRA 적용
         self.model = get_peft_model(self.model, peft_config)
-        self.model.print_trainable_parameters()
+        self.model.print_trainable_parameters()  # 학습 가능한 파라미터 비율 출력
 
-        dataset = ARCDataset(train_dataset_path, self.tokenizer, self, augment=False)
-        dataloader = DataLoader(
-            dataset, batch_size=batch_size, shuffle=True, collate_fn=dataset.collate_fn
-        )
+        dataset = ARCDataset(train_dataset, self.tokenizer, self)
+        dataloader = DataLoader(dataset, batch_size=1, shuffle=True)
 
-        optimizer = AdamW(self.model.parameters(), lr=lr)
+        optimizer = AdamW(self.model.parameters(), lr=5e-5)
 
+        # 메모리 효율성을 위한 그래디언트 누적 설정
+        gradient_accumulation_steps = 4
+
+        # Training loop
+        epochs = 5
         global_step = 0
         for epoch in range(epochs):
-            print(f"Starting Epoch {epoch+1}/{epochs}")
+            running = 0.0
+            optimizer.zero_grad()  # 에포크 시작 시 그래디언트 초기화
+
             for step, batch in enumerate(dataloader):
-                if max_steps > 0 and global_step >= max_steps:
-                    break
+                global_step += 1
+                # 배치 데이터를 디바이스로 이동
+                input_ids = batch["input_ids"].to(self.device)
+                target_ids = batch["target_ids"].to(self.device)
 
-                input_ids_batch = batch["input_ids"].to(self.device)
-                target_ids_batch = batch["target_ids"].to(self.device)
-                attention_mask_batch = batch["attention_mask"].to(self.device)
+                # loss = self.stepwise_loss(input_ids, target_ids)
+                loss = self.seq2seq_loss(input_ids, target_ids)
 
-                labels_batch = input_ids_batch.clone()
+                # 역전파
+                loss.backward()
 
-                combined_input_ids = []
-                labels = []
-                max_len = 0
-
-                for i in range(input_ids_batch.size(0)):
-                    prompt_len = (
-                        (input_ids_batch[i] != self.tokenizer.pad_token_id).sum().item()
-                    )
-                    target_len = (
-                        (target_ids_batch[i] != self.tokenizer.pad_token_id)
-                        .sum()
-                        .item()
-                    )
-
-                    current_combined = torch.cat(
-                        [
-                            input_ids_batch[i, :prompt_len],
-                            target_ids_batch[i, :target_len],
-                        ]
-                    )
-                    current_labels = torch.full_like(current_combined, -100)
-                    current_labels[prompt_len:] = target_ids_batch[i, :target_len]
-
-                    combined_input_ids.append(current_combined)
-                    labels.append(current_labels)
-                    if current_combined.size(0) > max_len:
-                        max_len = current_combined.size(0)
-
-                padded_combined_input_ids = torch.full(
-                    (input_ids_batch.size(0), max_len),
-                    self.tokenizer.pad_token_id,
-                    dtype=torch.long,
-                    device=self.device,
-                )
-                padded_labels = torch.full(
-                    (input_ids_batch.size(0), max_len),
-                    -100,
-                    dtype=torch.long,
-                    device=self.device,
-                )
-                new_attention_mask = torch.zeros(
-                    (input_ids_batch.size(0), max_len),
-                    dtype=torch.long,
-                    device=self.device,
-                )
-
-                for i in range(input_ids_batch.size(0)):
-                    seq_len = combined_input_ids[i].size(0)
-                    padded_combined_input_ids[i, :seq_len] = combined_input_ids[i]
-                    padded_labels[i, :seq_len] = labels[i]
-                    new_attention_mask[i, :seq_len] = 1
-
-                outputs = self.model(
-                    input_ids=padded_combined_input_ids,
-                    labels=padded_labels,
-                    attention_mask=new_attention_mask,
-                )
-                loss = outputs.loss
-
-                if loss is not None:
-                    loss = loss / grad_accum_steps
-                    loss.backward()
-
-                if (step + 1) % grad_accum_steps == 0:
+                # 그래디언트 누적 후 최적화
+                if global_step % gradient_accumulation_steps == 0:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                     optimizer.step()
                     optimizer.zero_grad()
+
+                # 손실 기록
+                running += loss.item() * gradient_accumulation_steps
+
+                # 로그 출력
+                if step % 10 == 0:
                     print(
-                        f"Epoch {epoch+1}, Step {global_step}, Loss: {loss.item() * grad_accum_steps:.4f}"
+                        f"[E{epoch+1}] step {step} loss {loss.item()*gradient_accumulation_steps:.4f}"
                     )
+                if global_step % 100 == 0:
+                    print("Saving model...")
+                    self.save_model()
 
-                global_step += 1
-            if max_steps > 0 and global_step >= max_steps:
-                break
+            # 에포크 종료 시 평균 손실 출력
+            print(f"Epoch {epoch+1} avg-loss {(running/len(dataloader)):.4f}")
 
-        os.makedirs(self.artifacts_path, exist_ok=True)
-        self.model.save_pretrained(self.artifacts_path)
-        self.tokenizer.save_pretrained(self.artifacts_path)
-        print(f"Model and tokenizer saved to {self.artifacts_path}")
-        self.model.eval()
+        self.model.eval()  # Set model back to evaluation mode
 
-    def predict(
-        self,
-        examples: List[Dict[str, Any]],
-        question_input: List[List[int]],
-        num_candidates: int = 3,
-        ttt_steps: int = 0,
-    ):
+    def save_model(self, data_path=None):
+        if data_path is None:
+            data_path = "artifacts/checkpoint-final_tmp"
+        os.makedirs(data_path, exist_ok=True)
+        self.model.save_pretrained(data_path)
+        model_info = {
+            "base_model": {
+                "name": self.model.config._name_or_path,
+                "type": self.model.config.model_type,
+                "hidden_size": int(self.model.config.hidden_size),
+                "vocab_size": int(self.tokenizer.vocab_size),
+            }
+        }
+        with open(os.path.join(data_path, "model_config.json"), "w") as f:
+            json.dump(model_info, f, indent=2)
+
+    def predict(self, examples, questions_input):
         """
         A single example of test data is given.
         You should predict 2D grid (List[List[int]] or np.ndarray)
@@ -393,274 +311,239 @@ class ARCSolver:
             output (List[List[int]]): A 2d grid,
                 which is the output of given input question.
         """
-        self.model.eval()
+        # --- BEGIN TTT (Test-Time Training) with Leave-One-Out and consistent formatting ---
+        self.model.train()
+        trainable_params = [p for p in self.model.parameters() if p.requires_grad]
 
-        original_model_state_dict = None
-        if ttt_steps > 0 and hasattr(
-            self.model, "named_parameters"
-        ):  # Check if model has parameters (e.g. not None)
-            try:
-                pass
-            except Exception as e:
-                print(f"Warning: Could not save original LoRA state for TTT: {e}")
-
-        if ttt_steps > 0:
-            print(f"Performing Test-Time Training for {ttt_steps} steps...")
-            self._perform_ttt(examples, ttt_steps=ttt_steps)
-
-        datapoint = {"train": examples, "test": [{"input": question_input}]}
-        prompt_details = self.format_prompt(datapoint)
-        input_ids = prompt_details["input_ids"].unsqueeze(0)
-
-        generation_config = GenerationConfig(
-            max_new_tokens=256,
-            eos_token_id=self.tokenizer.eos_token_id,
-            do_sample=True,
-            temperature=0.7,
-            top_p=0.9,
-            top_k=50,
-            num_return_sequences=num_candidates,
-            early_stopping=True,
-        )
-
-        with torch.no_grad():
-            outputs = self.model.generate(
-                input_ids=input_ids,
-                generation_config=generation_config,
+        if not trainable_params:
+            print(
+                "Warning: No trainable LoRA parameters found for TTT. LoRA adapter might not be configured for training or no adapter loaded."
             )
-
-        candidate_grids = []
-        for i in range(num_candidates):
-            output_tokens = outputs[i, input_ids.size(1) :].tolist()
-            parsed_grid = self.parse_grid(output_tokens)
-            candidate_grids.append(parsed_grid)
-
-        final_grid = np.random.randint(0, 10, (3, 3))
-        if not candidate_grids:
-            return final_grid.tolist()
-
-        ref_train_input = np.array(
-            prompt_details["train_examples_for_shape_ref"][0]["input"]
-        )
-        ref_train_output = np.array(
-            prompt_details["train_examples_for_shape_ref"][0]["output"]
-        )
-        ref_test_input = np.array(prompt_details["input_grid_for_shape_ref"])
-
-        target_x, target_y = ref_test_input.shape
-        if ref_train_input.shape == ref_train_output.shape:
-            target_x, target_y = ref_test_input.shape
-        elif ref_train_input.shape[0] != 0 and ref_train_input.shape[1] != 0:
-            if (
-                ref_train_output.shape[0] % ref_train_input.shape[0] == 0
-                and ref_train_output.shape[1] % ref_train_input.shape[1] == 0
-            ):
-                scale_x = ref_train_output.shape[0] // ref_train_input.shape[0]
-                scale_y = ref_train_output.shape[1] // ref_train_input.shape[1]
-                target_x = ref_test_input.shape[0] * scale_x
-                target_y = ref_test_input.shape[1] * scale_y
-            else:
-                target_x, target_y = (10, 10)
         else:
-            target_x, target_y = (10, 10)
+            optimizer = AdamW(
+                trainable_params, lr=5e-5
+            )  # Lowered learning rate for TTT
+            ttt_epochs = 1
 
-        for cand_grid_list in candidate_grids:
-            try:
-                if not cand_grid_list or not all(
-                    isinstance(r, list) for r in cand_grid_list
-                ):
-                    continue
-                if not cand_grid_list:
-                    continue
-                max_cols = 0
-                if cand_grid_list and isinstance(cand_grid_list[0], list):
-                    max_cols = (
-                        max(len(r) for r in cand_grid_list if isinstance(r, list))
-                        if cand_grid_list
-                        else 0
+            original_ttt_examples = examples
+
+            for epoch in range(ttt_epochs):
+                epoch_loss = 0.0
+                for i, current_train_on_example in enumerate(original_ttt_examples):
+                    few_shot_context_for_ttt = [
+                        e for idx, e in enumerate(original_ttt_examples) if idx != i
+                    ]
+
+                    ttt_question_input = current_train_on_example["input"]
+
+                    ttt_datapoint_for_prompt = {
+                        "train": few_shot_context_for_ttt,
+                        "test": [{"input": ttt_question_input}],
+                    }
+
+                    prompt_data_ttt = self.format_prompt(ttt_datapoint_for_prompt)
+                    prompt_ids_ttt = prompt_data_ttt["input_ids"].unsqueeze(0)
+
+                    target_grid_for_ttt = current_train_on_example["output"]
+                    target_tokens_ttt = self.format_grid(target_grid_for_ttt)
+                    target_tokens_ttt.append(self.tokenizer.eos_token_id)
+                    target_ids_ttt = torch.tensor(
+                        [target_tokens_ttt], dtype=torch.long, device=self.device
                     )
 
-                uniform_grid_list = []
-                for r in cand_grid_list:
-                    if isinstance(r, list):
-                        uniform_grid_list.append(r + [0] * (max_cols - len(r)))
+                    optimizer.zero_grad()
+                    loss = self.seq2seq_loss(prompt_ids_ttt, target_ids_ttt)
+                    loss.backward()
+                    optimizer.step()
+                    epoch_loss += loss.item()
 
-                if not uniform_grid_list:
-                    continue
+        self.model.eval()
+        # --- END TTT ---
+        datapoint = {"train": examples, "test": [{"input": questions_input}]}
 
-                grid_arr = np.array(uniform_grid_list)
-                if grid_arr.size == 0:
-                    continue
+        prompt = self.format_prompt(datapoint)
+        # input_ids = torch.tensor(prompt['input_ids'], dtype=torch.long).to(self.device).view(1, -1)
+        input_ids = prompt["input_ids"].unsqueeze(0)
 
-                if grid_arr.shape[0] >= target_x and grid_arr.shape[1] >= target_y:
-                    final_grid = grid_arr[:target_x, :target_y]
-                    break
-                elif grid_arr.size >= target_x * target_y:
-                    final_grid = np.resize(grid_arr, (target_x, target_y))
-                    break
-                else:
-                    padded_arr = np.zeros((target_x, target_y), dtype=int)
-                    min_rows = min(target_x, grid_arr.shape[0])
-                    min_cols = min(target_y, grid_arr.shape[1])
-                    if grid_arr.ndim == 2 and min_rows > 0 and min_cols > 0:
-                        padded_arr[:min_rows, :min_cols] = grid_arr[
-                            :min_rows, :min_cols
-                        ]
-                    final_grid = padded_arr
-                    break
-            except Exception as e:
-                continue
+        attn_mask = torch.ones_like(input_ids)
+
+        # Qwen3 모델은 더 많은 토큰을 생성할 수 있도록 설정
+        config = GenerationConfig(
+            temperature=0.7,
+            top_p=0.8,
+            top_k=20,  # 권장 값
+            bos_token_id=151643,  # Qwen3 모델의 내부 기본값 명시적 사용
+            eos_token_id=self.tokenizer.eos_token_id,
+            pad_token_id=self.tokenizer.pad_token_id,
+            max_new_tokens=150,
+            do_sample=True,
+        )
+
+        output = (
+            self.model.generate(
+                input_ids=input_ids,
+                generation_config=config,
+                attention_mask=attn_mask,
+            )
+            .squeeze()
+            .cpu()
+        )
+        N_prompt = input_ids.size(1)
+
+        output = output[N_prompt:].tolist()
+        train_input = np.array(prompt["train"][0]["input"])
+        train_output = np.array(prompt["train"][0]["output"])
+        test_input = np.array(prompt["input"])
+
+        # LLM-generated grid may have wrong shape
+        # So adjust shape by input-output pairs
+        if train_input.shape == train_output.shape:
+            x, y = test_input.shape
         else:
-            if candidate_grids and candidate_grids[0]:
-                try:
-                    first_cand_arr = np.array(candidate_grids[0])
-                    if first_cand_arr.size > 0:
-                        final_grid = np.resize(
-                            first_cand_arr, (target_x, target_y if target_y > 0 else 1)
-                        )
-                    else:
-                        final_grid = np.random.randint(
-                            0, 10, (max(1, target_x), max(1, target_y))
-                        )
-                except:
-                    final_grid = np.random.randint(
-                        0, 10, (max(1, target_x), max(1, target_y))
-                    )
-            else:
-                final_grid = np.random.randint(
-                    0, 10, (max(1, target_x), max(1, target_y))
-                )
+            x = train_output.shape[0] * test_input.shape[0] // train_input.shape[0]
+            y = train_output.shape[1] * test_input.shape[1] // train_input.shape[1]
 
-        return final_grid.tolist()
+        try:
+            grid = np.array(self.parse_grid(output))
+            # grid = grid[:x, :y]
+
+        except Exception as e:
+            grid = np.random.randint(0, 10, (x, y))
+
+        return grid
 
     def prepare_evaluation(self):
-        self._load_model_and_tokenizer()
+        """
+        Load pretrained weight, make model eval mode, etc.
+        """
+        # LoRA 어댑터 로드
         try:
+            peft_config = PeftConfig.from_pretrained("artifacts/checkpoint-final")
             self.model = PeftModel.from_pretrained(
-                self.model, self.artifacts_path, is_trainable=False
+                self.model, "artifacts/checkpoint-final", is_trainable=True
             )
-            print(
-                f"Successfully loaded LoRA adapter from {self.artifacts_path} for evaluation."
-            )
+            print("Loaded LoRA adapter")
         except Exception as e:
-            print(
-                f"No LoRA adapter found at {self.artifacts_path} or error loading: {e}. Using base model for evaluation."
-            )
+            print(f"No LoRA adapter found or incompatible: {e}")
+
         self.model.eval()
 
 
-class ARCDataset(Dataset):
-    """
-    Dataset class for ARC training examples.
-    """
+if __name__ == "__main__":
+    solver = ARCSolver()
 
-    def __init__(
-        self,
-        dataset_path_or_files: Any,
-        tokenizer: AutoTokenizer,
-        solver,
-        augment: bool = False,
-        max_examples_per_task: int = 100,
-        steps_per_file: int = 50,
-    ):
+
+# ARCDataset 클래스 정의
+class ARCDataset(Dataset):
+    """Dataset for ARC training examples"""
+
+    def __init__(self, examples, tokenizer, solver):
+        """
+        Initialize the ARC dataset
+
+        Args:
+            examples: Dataset object or path to dataset files
+            tokenizer: Tokenizer for encoding inputs
+            solver: ARCSolver instance
+        """
+        import glob
+        import os
+        import json
+        import random
+
         self.tokenizer = tokenizer
         self.solver = solver
-        self.augment = augment
-        self.max_examples_per_task = max_examples_per_task
-        self.steps_per_file = steps_per_file
 
-        # Determine the data files
-        if isinstance(dataset_path_or_files, str):
-            if os.path.isdir(dataset_path_or_files):
-                data_files = glob.glob(f"{dataset_path_or_files}/*.json")
-            elif os.path.isfile(
-                dataset_path_or_files
-            ) and dataset_path_or_files.endswith(".json"):
-                data_files = [dataset_path_or_files]
-            else:
-                raise ValueError(f"Invalid dataset path: {dataset_path_or_files}")
-        elif isinstance(dataset_path_or_files, list):
-            data_files = dataset_path_or_files
+        # 데이터셋 파일 경로 가져오기
+        if hasattr(examples, "data_files") and examples.data_files:
+            data_files = examples.data_files
         else:
-            print(
-                "No valid dataset paths provided. Expecting dataset objects or paths."
+            # 기본 데이터셋 경로 사용
+            dataset_path = os.environ.get(
+                "DATASET_PATH", "/home/student/workspace/dataset"
             )
-            self.all_examples = []
-            self.total_steps = 0
-            return
+            data_files = glob.glob(f"{dataset_path}/*.json")
 
         if not data_files:
-            raise ValueError("No dataset files found or provided.")
+            raise ValueError("데이터셋 파일이 없습니다. 경로를 확인해주세요.")
 
-        print(f"Loading {len(data_files)} JSON task files...")
+        print(f"총 {len(data_files)}개의 JSON 파일을 로드합니다.")
 
-        # Load data from all files
+        # 모든 JSON 파일을 로드하여 메모리에 저장
         self.all_examples = []
-
         for file_path in data_files:
             try:
                 with open(file_path, "r") as f:
                     file_examples = json.load(f)
-                    if isinstance(file_examples, list):
+                    if isinstance(file_examples, list) and len(file_examples) > 0:
                         self.all_examples.append(
                             {"file_path": file_path, "examples": file_examples}
                         )
             except Exception as e:
-                print(f"Error loading file {file_path}: {e}")
-                continue
+                print(f"파일 로드 중 오류 발생: {file_path} - {e}")
 
         if not self.all_examples:
-            raise ValueError("No valid examples found in the dataset files.")
+            raise ValueError("유효한 예제가 포함된 JSON 파일이 없습니다.")
 
+        print(f"총 {len(self.all_examples)}개의 JSON 파일이 성공적으로 로드되었습니다.")
+
+        # 총 학습 스텝 수 계산
+        self.steps_per_file = 50  # 각 파일당 샘플링할 스텝 수
         self.total_steps = len(self.all_examples) * self.steps_per_file
-        print(
-            f"Loaded {len(self.all_examples)} files with {self.total_steps} total steps."
-        )
+        print(f"총 학습 스텝 수: {self.total_steps}")
 
     def __len__(self):
+        """총 학습 스텝 수 반환"""
         return self.total_steps
 
-    def _sample_examples(self, examples: List[Dict], num_samples: int) -> List[Dict]:
+    def __getitem__(self, idx):
         """
-        Randomly sample a specified number of examples.
-        If examples are fewer than num_samples, sample with replacement.
-        """
-        if len(examples) < num_samples:
-            return random.choices(examples, k=num_samples)
-        return random.sample(examples, num_samples)
+        각 학습 스텝에 대한 데이터 샘플 반환
 
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        각 스텝에서는:
+        1. 랜덤하게 JSON 파일 선택
+        2. 해당 파일에서 4개의 예제 선택
+        3. 3개는 학습 예제로, 1개는 테스트 예제로 사용
         """
-        Fetch a single training example.
-        Each step randomly selects a JSON file and samples 4 examples:
-        - 3 for training
-        - 1 for testing
-        """
-        # Randomly select a file
+        import random
+
+        # 1. 랜덤하게 JSON 파일 하나 선택
         file_data = random.choice(self.all_examples)
         examples = file_data["examples"]
 
-        # Ensure we have enough examples
         if len(examples) < 4:
-            additional_file = random.choice(self.all_examples)
-            examples += additional_file["examples"]
+            # 예제가 4개 미만인 경우, 다른 파일에서 추가 예제 가져오기
+            if len(self.all_examples) > 1:
+                other_files = [f for f in self.all_examples if f != file_data]
+                additional_file = random.choice(other_files)
+                examples = examples + additional_file["examples"]
 
-        # Randomly sample 4 examples
-        selected_examples = self._sample_examples(examples, 4)
+            # 그래도 4개가 안되면 중복 사용
+            while len(examples) < 4:
+                examples = examples + examples
 
-        # Assign 3 for training, 1 for testing
+        # 2. 4개의 예제 랜덤 선택
+        selected_examples = random.sample(examples, 4)
+
+        # 3. 3개는 학습용, 1개는 테스트용으로 분리
         train_examples = selected_examples[:3]
         test_example = selected_examples[3]
 
-        # Construct the datapoint
+        # 4. 데이터포인트 구성
         datapoint = {
-            "train": train_examples,
-            "test": [{"input": test_example["input"]}],
+            "train": train_examples,  # 3개의 입력/출력 예제
+            "test": [{"input": test_example["input"]}],  # 테스트할 입력
         }
 
-        # Generate prompt and target tensors
+        # 5. 포맷 및 텐서 변환
         prompt = self.solver.format_prompt(datapoint)
-        input_ids = prompt["input_ids"]
+        # input_ids = torch.tensor(prompt['input_ids'], dtype=torch.long)
+        if isinstance(prompt["input_ids"], torch.Tensor):
+            input_ids = prompt["input_ids"].clone().detach()
+        else:
+            input_ids = torch.tensor(prompt["input_ids"], dtype=torch.long)
+
+        # 실제 정답 (타겟)
         target_output = test_example["output"]
         target_tokens = self.solver.format_grid(target_output)
         target_ids = torch.tensor(target_tokens, dtype=torch.long)
@@ -668,37 +551,4 @@ class ARCDataset(Dataset):
         return {
             "input_ids": input_ids,
             "target_ids": target_ids,
-            "attention_mask": torch.ones_like(input_ids),
         }
-
-    def collate_fn(
-        self, batch: List[Dict[str, torch.Tensor]]
-    ) -> Dict[str, torch.Tensor]:
-        """
-        Collate function to handle padding and tensor creation.
-        """
-        input_ids_list = [item["input_ids"] for item in batch]
-        target_ids_list = [item["target_ids"] for item in batch]
-
-        # Pad sequences
-        padded_input_ids = torch.nn.utils.rnn.pad_sequence(
-            input_ids_list, batch_first=True, padding_value=self.tokenizer.pad_token_id
-        )
-        padded_target_ids = torch.nn.utils.rnn.pad_sequence(
-            target_ids_list, batch_first=True, padding_value=self.tokenizer.pad_token_id
-        )
-
-        # Create attention masks
-        attention_mask = (padded_input_ids != self.tokenizer.pad_token_id).long()
-
-        return {
-            "input_ids": padded_input_ids,
-            "target_ids": padded_target_ids,
-            "attention_mask": attention_mask,
-        }
-
-
-if __name__ == "__main__":
-    solver = ARCSolver()
-
-    # Example usage

@@ -148,6 +148,32 @@ class ARCSolver:
             "train": train_examples,
         }
 
+    def color_shift_grid(
+        self, grid: List[List[int]], shift: int, modulo: int = 10
+    ) -> List[List[int]]:
+        """각 픽셀값에 shift를 더하고 modulo 연산으로 색을 이동시킵니다."""
+        return [[(c + shift) % modulo for c in row] for row in grid]
+
+    def augment_contexts(
+        self, examples: List[dict], shifts: List[int]
+    ) -> List[List[dict]]:
+        augmented: List[dict] = []
+        for ex in examples:
+            augmented.append({"input": ex["input"], "output": ex["output"]})
+        for s in shifts:
+            for ex in examples:
+                inp = self.color_shift_grid(ex["input"], s)
+                outp = self.color_shift_grid(ex["output"], s)
+                augmented.append({"input": inp, "output": outp})
+        seen = set()
+        unique = []
+        for ex in augmented:
+            key = (tuple(map(tuple, ex["input"])), tuple(map(tuple, ex["output"])))
+            if key not in seen:
+                seen.add(key)
+                unique.append(ex)
+        return unique
+
     def stepwise_loss(self, prompt_ids, target_ids, use_cache=False):
         """
         prompt_ids : [1, L]  (프롬프트)
@@ -321,42 +347,34 @@ class ARCSolver:
             )
         else:
             optimizer = AdamW(
-                trainable_params, lr=5e-5
+                trainable_params, lr=1e-5
             )  # Lowered learning rate for TTT
             ttt_epochs = 1
+            aug_exs = self.augment_contexts(examples, shifts=[2, 5, 8])
+            import random
 
-            original_ttt_examples = examples
+            random.shuffle(aug_exs)
+
+            n = len(aug_exs) - (len(aug_exs) % 4)
+            groups = [aug_exs[i : i + 4] for i in range(0, n, 4)]
 
             for epoch in range(ttt_epochs):
-                epoch_loss = 0.0
-                for i, current_train_on_example in enumerate(original_ttt_examples):
-                    few_shot_context_for_ttt = [
-                        e for idx, e in enumerate(original_ttt_examples) if idx != i
+                optimizer.zero_grad()
+                for grp in groups:
+                    ctx, test_ex = grp[:3], grp[3]
+                    dp = {"train": ctx, "test": [{"input": test_ex["input"]}]}
+                    prompt = self.format_prompt(dp)
+                    input_ids = prompt["input_ids"].unsqueeze(0).to(self.device)
+
+                    tgt = self.format_grid(test_ex["output"]) + [
+                        self.tokenizer.eos_token_id
                     ]
+                    target_ids = torch.tensor([tgt], device=self.device)
 
-                    ttt_question_input = current_train_on_example["input"]
-
-                    ttt_datapoint_for_prompt = {
-                        "train": few_shot_context_for_ttt,
-                        "test": [{"input": ttt_question_input}],
-                    }
-
-                    prompt_data_ttt = self.format_prompt(ttt_datapoint_for_prompt)
-                    prompt_ids_ttt = prompt_data_ttt["input_ids"].unsqueeze(0)
-
-                    target_grid_for_ttt = current_train_on_example["output"]
-                    target_tokens_ttt = self.format_grid(target_grid_for_ttt)
-                    target_tokens_ttt.append(self.tokenizer.eos_token_id)
-                    target_ids_ttt = torch.tensor(
-                        [target_tokens_ttt], dtype=torch.long, device=self.device
-                    )
-
-                    optimizer.zero_grad()
-                    loss = self.seq2seq_loss(prompt_ids_ttt, target_ids_ttt)
+                    loss = self.seq2seq_loss(input_ids, target_ids)
                     loss.backward()
                     optimizer.step()
-                    epoch_loss += loss.item()
-
+                    optimizer.zero_grad()
         self.model.eval()
         # --- END TTT ---
         datapoint = {"train": examples, "test": [{"input": questions_input}]}

@@ -24,6 +24,26 @@ import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.utils.data import Dataset, DataLoader
 
+import random
+
+# --- Augmentation Helpers ---
+def rotate_grid_augmentation(grid_list_list: List[List[int]], k: int) -> List[List[int]]:
+    """Rotate grid by k * 90 degrees clockwise."""
+    if not grid_list_list or not grid_list_list[0]:
+        return grid_list_list
+    return np.rot90(np.array(grid_list_list, dtype=int), k=-k).tolist()
+
+def flip_grid_augmentation(grid_list_list: List[List[int]], axis: int) -> List[List[int]]:
+    """Flip grid. axis 0 for UD, 1 for LR."""
+    if not grid_list_list or not grid_list_list[0]:
+        return grid_list_list
+    return np.flip(np.array(grid_list_list, dtype=int), axis=axis).tolist()
+
+def permute_colors_augmentation(grid_list_list: List[List[int]], color_map: dict[int, int]) -> List[List[int]]:
+    """Permute colors in the grid using a color_map, keeping background (0) if not in map."""
+    if not grid_list_list or not grid_list_list[0]:
+        return grid_list_list
+    return [[color_map.get(c, c) for c in row] for row in grid_list_list]
 
 class ARCSolver:
     """
@@ -148,31 +168,106 @@ class ARCSolver:
             "train": train_examples,
         }
 
-    def color_shift_grid(
-        self, grid: List[List[int]], shift: int, modulo: int = 10
-    ) -> List[List[int]]:
-        """각 픽셀값에 shift를 더하고 modulo 연산으로 색을 이동시킵니다."""
-        return [[(c + shift) % modulo for c in row] for row in grid]
-
-    def augment_contexts(
-        self, examples: List[dict], shifts: List[int]
-    ) -> List[List[dict]]:
-        augmented: List[dict] = []
-        for ex in examples:
-            augmented.append({"input": ex["input"], "output": ex["output"]})
-        for s in shifts:
-            for ex in examples:
-                inp = self.color_shift_grid(ex["input"], s)
-                outp = self.color_shift_grid(ex["output"], s)
-                augmented.append({"input": inp, "output": outp})
-        seen = set()
-        unique = []
-        for ex in augmented:
-            key = (tuple(map(tuple, ex["input"])), tuple(map(tuple, ex["output"])))
-            if key not in seen:
-                seen.add(key)
-                unique.append(ex)
-        return unique
+    def _get_optimized_ttt_samples(self, original_examples: List[dict]) -> List[dict]:
+        """
+        Generate a minimal set of TTT samples for time-constrained inference.
+        Optimized to create only 3-4 samples total, focusing on the most effective augmentations.
+        """
+        augmented_samples = [] # Each dict: {"context": [...], "ttt_input": grid, "ttt_output": grid}
+        
+        if not original_examples or len(original_examples) < 2:
+            return []  # Need at least 2 examples for meaningful TTT
+            
+        # Select only the most effective transformations
+        # Identity is always included, plus one rotation and one flip at most
+        geometric_transforms = {
+            "identity": lambda g: g,
+            "rot90": lambda g: rotate_grid_augmentation(g, 1),
+            "flip_lr": lambda g: flip_grid_augmentation(g, 1),
+        }
+        
+        # Use only 1-2 examples for leave-one-out to minimize sample count
+        num_examples_to_use = min(2, len(original_examples))
+        selected_example_indices = random.sample(range(len(original_examples)), num_examples_to_use)
+        
+        for i in selected_example_indices:
+            # Leave-One-Out: current example is the target for TTT
+            ttt_target_example = original_examples[i]
+            ttt_context_examples_orig = [ex for k, ex in enumerate(original_examples) if k != i]
+            
+            # Apply only identity transform to save time
+            # This gives us the basic leave-one-out sample
+            current_transformed_context = ttt_context_examples_orig.copy()
+            augmented_samples.append({
+                "context": current_transformed_context,
+                "ttt_input": ttt_target_example["input"],
+                "ttt_output": ttt_target_example["output"]
+            })
+            
+            # Add just one geometric transform sample for diversity
+            if len(augmented_samples) < 2:  # Limit to 2 samples max at this point
+                transform_name = random.choice(["rot90", "flip_lr"])
+                transform_func = geometric_transforms[transform_name]
+                
+                try:
+                    # Transform context
+                    geom_transformed_context = []
+                    for ctx_ex in ttt_context_examples_orig:
+                        geom_transformed_context.append({
+                            "input": transform_func(ctx_ex["input"]),
+                            "output": transform_func(ctx_ex["output"])
+                        })
+                    # Transform target
+                    transformed_ttt_input = transform_func(ttt_target_example["input"])
+                    transformed_ttt_output = transform_func(ttt_target_example["output"])
+                    
+                    augmented_samples.append({
+                        "context": geom_transformed_context,
+                        "ttt_input": transformed_ttt_input,
+                        "ttt_output": transformed_ttt_output
+                    })
+                except Exception:
+                    # Skip if transformation fails
+                    pass
+        
+        # Add one color permutation sample if we have room (max 3 samples total)
+        if len(augmented_samples) < 3 and len(original_examples) > 0:
+            try:
+                # Use the first example as target for simplicity
+                color_target = original_examples[0]
+                color_context = [ex for k, ex in enumerate(original_examples) if k != 0]
+                if not color_context:
+                    color_context = [color_target]  # Use target as context if it's the only example
+                
+                # Create a simple color permutation
+                colors_to_permute = list(range(1, 10))  # Exclude background 0
+                if len(colors_to_permute) > 1:
+                    permuted_colors = random.sample(colors_to_permute, len(colors_to_permute))
+                    color_map = {orig: perm for orig, perm in zip(colors_to_permute, permuted_colors)}
+                    
+                    color_perm_context = []
+                    for ctx_ex in color_context:
+                        color_perm_context.append({
+                            "input": permute_colors_augmentation(ctx_ex["input"], color_map),
+                            "output": permute_colors_augmentation(ctx_ex["output"], color_map)
+                        })
+                    color_perm_ttt_input = permute_colors_augmentation(color_target["input"], color_map)
+                    color_perm_ttt_output = permute_colors_augmentation(color_target["output"], color_map)
+                    
+                    augmented_samples.append({
+                        "context": color_perm_context,
+                        "ttt_input": color_perm_ttt_input,
+                        "ttt_output": color_perm_ttt_output
+                    })
+            except Exception:
+                # Skip if color permutation fails
+                pass
+                
+        # Ensure we don't have too many samples (max 4)
+        if len(augmented_samples) > 4:
+            augmented_samples = random.sample(augmented_samples, 4)
+            
+        return augmented_samples
 
     def stepwise_loss(self, prompt_ids, target_ids, use_cache=False):
         """
@@ -337,44 +432,57 @@ class ARCSolver:
             output (List[List[int]]): A 2d grid,
                 which is the output of given input question.
         """
+        import time
+        
+        start_time = time.time()
         # --- BEGIN TTT (Test-Time Training) with Leave-One-Out and consistent formatting ---
         self.model.train()
         trainable_params = [p for p in self.model.parameters() if p.requires_grad]
 
-        if not trainable_params:
-            print(
-                "Warning: No trainable LoRA parameters found for TTT. LoRA adapter might not be configured for training or no adapter loaded."
-            )
+        time_before_ttt = time.time()
+        time_remaining = 50 - (time_before_ttt - start_time) 
+
+        if time_remaining < 40:
+            self.model.eval()  
+            print(f"Warning: Skipping TTT due to time constraints. Only {time_remaining:.1f}s remaining.")
         else:
-            optimizer = AdamW(
-                trainable_params, lr=1e-5
-            )  # Lowered learning rate for TTT
-            ttt_epochs = 1
-            aug_exs = self.augment_contexts(examples, shifts=[2, 5, 8])
-            import random
-
-            random.shuffle(aug_exs)
-
-            n = len(aug_exs) - (len(aug_exs) % 4)
-            groups = [aug_exs[i : i + 4] for i in range(0, n, 4)]
-
-            for epoch in range(ttt_epochs):
-                optimizer.zero_grad()
-                for grp in groups:
-                    ctx, test_ex = grp[:3], grp[3]
-                    dp = {"train": ctx, "test": [{"input": test_ex["input"]}]}
-                    prompt = self.format_prompt(dp)
-                    input_ids = prompt["input_ids"].unsqueeze(0).to(self.device)
-
-                    tgt = self.format_grid(test_ex["output"]) + [
-                        self.tokenizer.eos_token_id
-                    ]
-                    target_ids = torch.tensor([tgt], device=self.device)
-
-                    loss = self.seq2seq_loss(input_ids, target_ids)
-                    loss.backward()
-                    optimizer.step()
-                    optimizer.zero_grad()
+            trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+            
+            if trainable_params:
+                optimizer = AdamW(trainable_params, lr=5e-7)
+                
+                ttt_max_steps = 8 
+                
+                ttt_samples = self._get_optimized_ttt_samples(examples)
+                
+                if ttt_samples:
+                    for step_num in range(ttt_max_steps):
+                        current_time = time.time()
+                        time_used_so_far = current_time - start_time
+                        
+                        if time_used_so_far > 40:
+                            print(f"TTT stopped early at step {step_num}/{ttt_max_steps} due to time constraints")
+                            break
+                            
+                        ttt_sample = random.choice(ttt_samples)
+                        
+                        ttt_datapoint = {
+                            "train": ttt_sample["context"],
+                            "test": [{"input": ttt_sample["ttt_input"]}]
+                        }
+                        prompt_data = self.format_prompt(ttt_datapoint)
+                        input_ids = prompt_data["input_ids"].unsqueeze(0).to(self.device)
+                        
+                        target_grid_tokens = self.format_grid(ttt_sample["ttt_output"])
+                        if self.tokenizer.eos_token_id is not None:
+                            target_grid_tokens.append(self.tokenizer.eos_token_id)
+                        target_ids = torch.tensor([target_grid_tokens], device=self.device)
+                        
+                        optimizer.zero_grad()
+                        loss = self.seq2seq_loss(input_ids, target_ids)
+                        loss.backward()
+                        torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
+                        optimizer.step()
         self.model.eval()
         # --- END TTT ---
         datapoint = {"train": examples, "test": [{"input": questions_input}]}
@@ -523,7 +631,6 @@ class ARCDataset(Dataset):
         2. 해당 파일에서 4개의 예제 선택
         3. 3개는 학습 예제로, 1개는 테스트 예제로 사용
         """
-        import random
 
         # 1. 랜덤하게 JSON 파일 하나 선택
         file_data = random.choice(self.all_examples)
